@@ -48,7 +48,19 @@ async function initialize() {
   }
 }
 
-// --- 2. GITEA API CLIENT ---
+// --- 2. GITEA API CLIENT & HELPERS ---
+
+/**
+ * Creates a standardized JSON error response.
+ * @param message The error message.
+ * @param status The HTTP status code.
+ * @returns A Response object with a JSON body.
+ */
+function jsonErrorResponse(message: string, status: number): Response {
+  return Response.json({error: message}, {status});
+}
+
+
 /**
  * A generic fetch client for the Gitea API.
  * @param path The API path (e.g., /user/repos)
@@ -76,9 +88,19 @@ async function giteaApiRequest(
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(
-      `Gitea API Error: ${response.status} ${response.statusText} - ${errorText}`,
-    );
+    // Prepend the status to the error message for better context in logs
+    let errorMessage = `Gitea API Error: ${response.status} ${response.statusText}`;
+    try {
+      // If Gitea returns a JSON error, include its message
+      const errorJson = JSON.parse(errorText);
+      if (errorJson.message) {
+        errorMessage += ` - ${errorJson.message}`;
+      }
+    } catch {
+      // Otherwise, use the raw text
+      errorMessage += ` - ${errorText}`;
+    }
+    throw new Error(errorMessage, {cause: response.status});
   }
 
   if (response.status === STATUS_CODE.NoContent) {
@@ -105,7 +127,7 @@ async function handleGetRepos(_req: Request, _match: URLPatternResult): Promise<
     return Response.json(simplifiedRepos);
   } catch (error) {
     console.error("获取仓库列表失败:", error);
-    return new Response("无法从 Gitea 获取仓库列表", {status: 500});
+    return jsonErrorResponse("无法从 Gitea 获取仓库列表", STATUS_CODE.InternalServerError);
   }
 }
 
@@ -113,38 +135,29 @@ async function handleGetRepos(_req: Request, _match: URLPatternResult): Promise<
 async function handleListIssues(req: Request, match: URLPatternResult): Promise<Response> {
   const {owner, repo} = match.pathname.groups;
   if (!owner || !repo) {
-    return new Response("请求路径参数不完整", {status: 400});
+    return jsonErrorResponse("请求路径参数不完整", STATUS_CODE.BadRequest);
   }
 
   const url = new URL(req.url);
-  const state = url.searchParams.get("state") || "all"; // Default to 'all' for better filtering
+  const state = url.searchParams.get("state") || "all";
   const filter = url.searchParams.get("filter");
 
   try {
     let issues = [];
-
-    // If filter=mine, fetch issues related to the current user
     if (!filter || filter === 'mine') {
       if (!currentGiteaUser) {
-        // This should not happen if initialization is successful
-        return new Response("服务未正确初始化，无法获取用户信息。", {status: 503});
+        return jsonErrorResponse("服务未正确初始化，无法获取用户信息。", STATUS_CODE.ServiceUnavailable);
       }
-
-      // Fetch "assigned to me" and "created by me" issues in parallel
       const [assignedIssues, createdIssues] = await Promise.all([
         giteaApiRequest(`/repos/${owner}/${repo}/issues?state=${state}&assignee=${currentGiteaUser}`, "GET"),
         giteaApiRequest(`/repos/${owner}/${repo}/issues?state=${state}&created_by=${currentGiteaUser}`, "GET")
       ]);
-
-      // Merge and deduplicate results using a Map
       const issueMap = new Map();
       [...assignedIssues, ...createdIssues].forEach((issue: any) => {
         issueMap.set(issue.id, issue);
       });
       issues = Array.from(issueMap.values());
-
     } else {
-      // Otherwise, fetch all issues based on state
       issues = await giteaApiRequest(`/repos/${owner}/${repo}/issues?state=${state}`, "GET");
     }
 
@@ -157,12 +170,10 @@ async function handleListIssues(req: Request, match: URLPatternResult): Promise<
       html_url: issue.html_url,
       created_at: issue.created_at,
     }));
-
     return Response.json(simplifiedIssues);
-
   } catch (error) {
     console.error(`获取 ${owner}/${repo} 的 Issue 列表失败:`, error);
-    return new Response("无法从 Gitea 获取 Issue 列表", {status: 500});
+    return jsonErrorResponse("无法从 Gitea 获取 Issue 列表", STATUS_CODE.InternalServerError);
   }
 }
 
@@ -170,7 +181,7 @@ async function handleListIssues(req: Request, match: URLPatternResult): Promise<
 async function handleGetIssueDetails(_req: Request, match: URLPatternResult): Promise<Response> {
   const {owner, repo, index} = match.pathname.groups;
   if (!owner || !repo || !index) {
-    return new Response("请求路径参数不完整", {status: 400});
+    return jsonErrorResponse("请求路径参数不完整", STATUS_CODE.BadRequest);
   }
 
   try {
@@ -191,10 +202,10 @@ async function handleGetIssueDetails(_req: Request, match: URLPatternResult): Pr
     });
   } catch (error) {
     console.error(`获取 Issue #${index} 状态失败:`, error);
-    if (error instanceof Error && error.message.includes("404")) {
-      return new Response(`在 ${owner}/${repo} 中未找到 Issue #${index}`, {status: 404});
+    if (error.cause === STATUS_CODE.NotFound) {
+      return jsonErrorResponse(`在 ${owner}/${repo} 中未找到 Issue #${index}`, STATUS_CODE.NotFound);
     }
-    return new Response("无法从 Gitea 获取 Issue 状态", {status: 500});
+    return jsonErrorResponse("无法从 Gitea 获取 Issue 状态", STATUS_CODE.InternalServerError);
   }
 }
 
@@ -202,27 +213,27 @@ async function handleGetIssueDetails(_req: Request, match: URLPatternResult): Pr
 async function handleCreateIssue(req: Request, match: URLPatternResult): Promise<Response> {
   const {owner, repo} = match.pathname.groups;
   if (!owner || !repo) {
-    return new Response("请求路径参数不完整", {status: 400});
+    return jsonErrorResponse("请求路径参数不完整", STATUS_CODE.BadRequest);
   }
 
   let body;
   try {
     body = await req.json();
   } catch {
-    return new Response("无效的 JSON 请求体", {status: 400});
+    return jsonErrorResponse("无效的 JSON 请求体", STATUS_CODE.BadRequest);
   }
 
-  if (!body.title || typeof body.title !== "string") {
-    return new Response('请求体必须包含一个 "title" 字符串', {status: 400});
+  if (!body.title || typeof body.title !== "string" || body.title.trim() === "") {
+    return jsonErrorResponse('请求体必须包含一个非空的 "title" 字符串', STATUS_CODE.UnprocessableEntity); // 422 is more specific here
   }
 
   try {
     const newIssuePayload = {title: body.title, body: body.body || ""};
     const createdIssue = await giteaApiRequest(`/repos/${owner}/${repo}/issues`, "POST", newIssuePayload);
-    return Response.json(createdIssue, {status: 201});
+    return Response.json(createdIssue, {status: STATUS_CODE.Created});
   } catch (error) {
     console.error("创建 Issue 失败:", error);
-    return new Response("无法在 Gitea 中创建 Issue", {status: 500});
+    return jsonErrorResponse("无法在 Gitea 中创建 Issue", STATUS_CODE.InternalServerError);
   }
 }
 
@@ -230,17 +241,16 @@ async function handleCreateIssue(req: Request, match: URLPatternResult): Promise
 async function handleGetIssueTimeline(_req: Request, match: URLPatternResult): Promise<Response> {
   const {owner, repo, index} = match.pathname.groups;
   if (!owner || !repo || !index) {
-    return new Response("请求路径参数不完整", {status: 400});
+    return jsonErrorResponse("请求路径参数不完整", STATUS_CODE.BadRequest);
   }
 
   try {
     const timelineEvents = await giteaApiRequest(`/repos/${owner}/${repo}/issues/${index}/timeline`, "GET");
-
     const simplifiedTimeline = timelineEvents.map((event: any) => {
       let content = "";
-      switch (event.type) {
+      switch (event.event) { // Gitea API uses 'event', not 'type'
         case "closed":
-        case "close": // Compatibility for different event names
+        case "close":
           content = `关闭了此 Issue`;
           break;
         case "reopened":
@@ -266,10 +276,10 @@ async function handleGetIssueTimeline(_req: Request, match: URLPatternResult): P
           content = `将任务指派给: ${(event.assignee || {}).login || "未知"}`;
           break;
         default:
-          content = `未处理的事件类型: ${event.type}`;
+          content = `未处理的事件类型: ${event.event}`;
       }
       return {
-        type: event.type,
+        type: event.event,
         user: (event.user?.full_name || event.user?.username) || "system",
         content: content,
         created_at: event.created_at,
@@ -278,10 +288,10 @@ async function handleGetIssueTimeline(_req: Request, match: URLPatternResult): P
     return Response.json(simplifiedTimeline);
   } catch (error) {
     console.error(`获取 Issue #${index} 的时间线失败:`, error);
-    if (error instanceof Error && error.message.includes("404")) {
-      return new Response(`在 ${owner}/${repo} 中未找到 Issue #${index}`, {status: 404});
+    if (error.cause === STATUS_CODE.NotFound) {
+      return jsonErrorResponse(`在 ${owner}/${repo} 中未找到 Issue #${index}`, STATUS_CODE.NotFound);
     }
-    return new Response("无法从 Gitea 获取时间线", {status: 500});
+    return jsonErrorResponse("无法从 Gitea 获取时间线", STATUS_CODE.InternalServerError);
   }
 }
 
@@ -290,7 +300,7 @@ async function handleGetIssueTimeline(_req: Request, match: URLPatternResult): P
  * Main function to initialize and start the HTTP server.
  */
 async function startServer() {
-  await initialize(); // Wait for initialization to complete
+  await initialize();
 
   console.log("Gitea API 服务正在启动，监听 http://localhost:8000");
   Deno.serve(async (req: Request) => {
@@ -310,15 +320,16 @@ async function startServer() {
       },
     ];
 
+    const url = new URL(req.url);
     for (const route of routes) {
-      const match = route.pattern.exec(req.url);
+      const match = route.pattern.exec(url);
       if (match && req.method === route.method) {
-        // This dynamic dispatch is sound, but TypeScript can't fully infer the type.
-        // @ts-ignore
+        // @ts-ignore: TS can't fully infer the dynamic handler signature here but it's safe.
         return await route.handler(req, match);
       }
     }
-    return new Response("404 Not Found", {status: 404});
+
+    return jsonErrorResponse("Not Found", STATUS_CODE.NotFound);
   });
 }
 
